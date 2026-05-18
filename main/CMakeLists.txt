@@ -17,6 +17,8 @@ idf_component_register(SRCS "esp32_nat_router.c"
                             "vpn_manager.c"
                             "netif_hooks.c"
                             "led_strip_status.c"
+                            "dns_filter.c"
+                            "http_server_dns_filter_handlers.c"
                     INCLUDE_DIRS "."
                     PRIV_REQUIRES ${main_priv_requires})
 target_compile_options(__idf_main PRIVATE -O2)
