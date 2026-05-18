@@ -10,48 +10,36 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # ── 1. 检出代码 ─────────────────────────────────────────
       - name: Checkout this repo
         uses: actions/checkout@v4
 
-      # ── 2. 克隆上游 esp32_nat_router ─────────────────────────
       - name: Clone upstream esp32_nat_router
         run: |
           git clone --depth=1 https://github.com/martin-ger/esp32_nat_router.git upstream
-          cp main/dns_filter.h    upstream/main/
-          cp main/dns_filter.c    upstream/main/
-          cp main/dns_server.c    upstream/main/dns_server.c
+          cp main/dns_filter.h                      upstream/main/
+          cp main/dns_filter.c                      upstream/main/
+          cp main/dns_server.c                      upstream/main/dns_server.c
           cp main/http_server_dns_filter_handlers.c upstream/main/
 
-      # ── 3. 修复 idf_component.yml：加入 esp32s3 支持 ─────────
-      - name: Patch idf_component.yml for esp32s3
+      # 直接删掉所有 idf_component.yml，彻底消除目标芯片限制
+      - name: Remove idf_component.yml target restrictions
         working-directory: upstream
         run: |
-          python3 - <<'PYEOF'
-          import pathlib, re
-
-          for yml_path in pathlib.Path('.').rglob('idf_component.yml'):
-              txt = yml_path.read_text()
-              print(f"Found: {yml_path}\nBefore:\n{txt}\n")
-
-              if 'targets' in txt:
-                  txt = re.sub(
-                      r'(targets\s*:\s*\[)([^\]]+)(\])',
-                      lambda m: m.group(1) + m.group(2).rstrip() + ', esp32s3' + m.group(3)
-                          if 'esp32s3' not in m.group(2) else m.group(0),
-                      txt
-                  )
-                  if 'esp32s3' not in txt:
-                      txt = re.sub(
-                          r'(targets:.*\n(?:\s+-\s+\S+\n)*)',
-                          r'\1  - esp32s3\n',
-                          txt
-                      )
-              yml_path.write_text(txt)
-              print(f"After:\n{txt}\n")
+          find . -name "idf_component.yml" | while read f; do
+            echo "Removing target restriction from: $f"
+            python3 - "$f" <<'PYEOF'
+          import sys, re, pathlib
+          p = pathlib.Path(sys.argv[1])
+          txt = p.read_text()
+          # 删掉整个 targets 行（单行格式）
+          txt = re.sub(r'^\s*targets\s*:.*$', '', txt, flags=re.MULTILINE)
+          # 删掉 YAML 列表格式的 targets 块
+          txt = re.sub(r'targets:\s*\n(\s+-\s+\S+\s*\n)+', '', txt)
+          p.write_text(txt)
+          print(p.read_text())
           PYEOF
+          done
 
-      # ── 4. 修改 CMakeLists.txt ───────────────────────────────
       - name: Patch CMakeLists.txt
         working-directory: upstream
         run: |
@@ -59,7 +47,7 @@ jobs:
           import pathlib, re
           p = pathlib.Path('main/CMakeLists.txt')
           txt = p.read_text()
-          print(f"CMakeLists before:\n{txt}")
+          print("Before:", txt)
           if 'dns_filter.c' not in txt:
               txt = re.sub(
                   r'(idf_component_register\(SRCS\s+")',
@@ -67,11 +55,10 @@ jobs:
                   txt, count=1
               )
               p.write_text(txt)
-          print(f"CMakeLists after:\n{p.read_text()}")
+          print("After:", p.read_text())
           PYEOF
 
-      # ── 5. Patch app_main.c 和 http_server.c ─────────────────
-      - name: Patch source files
+      - name: Patch app_main.c and http_server.c
         working-directory: upstream
         run: |
           python3 - <<'PYEOF'
@@ -110,41 +97,34 @@ jobs:
               break
           PYEOF
 
-      # ── 6. 配置 sdkconfig for ESP32-S3 ──────────────────────
       - name: Patch sdkconfig.defaults
         working-directory: upstream
         run: |
-          grep -v 'CONFIG_IDF_TARGET\|CONFIG_ESPTOOLPY_FLASH' sdkconfig.defaults > tmp.defaults || true
-          mv tmp.defaults sdkconfig.defaults
-          cat >> sdkconfig.defaults << 'EOF'
-          CONFIG_IDF_TARGET="esp32s3"
-          CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-          EOF
+          grep -v 'CONFIG_IDF_TARGET\|CONFIG_ESPTOOLPY_FLASH' sdkconfig.defaults > tmp || true
+          mv tmp sdkconfig.defaults
+          printf '\nCONFIG_IDF_TARGET="esp32s3"\nCONFIG_ESPTOOLPY_FLASHSIZE_4MB=y\n' >> sdkconfig.defaults
+          cat sdkconfig.defaults
 
-      # ── 7. 编译 ──────────────────────────────────────────────
-      - name: Setup ESP-IDF v5.2 and build
+      # 换用 ESP-IDF v5.3，原生支持 esp32s3，且组件管理器版本匹配
+      - name: Build with ESP-IDF v5.3
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: v5.2.2
+          esp_idf_version: v5.3.2
           target: esp32s3
           path: upstream
-          command: >
-            pip install --upgrade idf-component-manager &&
-            idf.py build
+          command: idf.py build
 
-      # ── 8. 收集 bin 文件 ─────────────────────────────────────
       - name: Collect firmware binaries
         run: |
           mkdir -p firmware
-          find upstream/build -name "*.bin" -exec cp {} firmware/ \; 2>/dev/null || true
+          find upstream/build -name "*.bin"          -exec cp {} firmware/ \; 2>/dev/null || true
           find upstream/build -name "flasher_args.json" -exec cp {} firmware/ \; 2>/dev/null || true
 
           cat > firmware/flash.sh << 'FLASH'
           #!/bin/bash
           PORT=${1:-/dev/ttyUSB0}
-          BAUD=921600
           echo "Flashing to $PORT ..."
-          esptool.py --chip esp32s3 --port "$PORT" --baud "$BAUD" \
+          esptool.py --chip esp32s3 --port "$PORT" --baud 921600 \
             --before default_reset --after hard_reset write_flash \
             -z --flash_mode dio --flash_freq 80m --flash_size 4MB \
             0x0     bootloader.bin \
@@ -153,20 +133,18 @@ jobs:
           FLASH
           chmod +x firmware/flash.sh
 
-          cat > firmware/flash_windows.bat << 'FLASHBAT'
+          cat > firmware/flash_windows.bat << 'BAT'
           @echo off
           set PORT=COM3
-          set BAUD=921600
-          esptool.exe --chip esp32s3 --port %PORT% --baud %BAUD% ^
+          esptool.exe --chip esp32s3 --port %PORT% --baud 921600 ^
             --before default_reset --after hard_reset write_flash ^
             -z --flash_mode dio --flash_freq 80m --flash_size 4MB ^
             0x0     bootloader.bin ^
             0x8000  partition-table.bin ^
             0x10000 esp32_nat_router.bin
-          FLASHBAT
+          BAT
           ls -lh firmware/
 
-      # ── 9. 上传 Artifact ─────────────────────────────────────
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
