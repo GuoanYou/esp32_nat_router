@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 NAT Router – DNS 过滤</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       background:#0f172a;color:#e2e8f0;min-height:100vh;padding:20px}
+  h1{font-size:1.4rem;font-weight:700;color:#38bdf8;margin-bottom:4px}
+  .sub{font-size:.8rem;color:#64748b;margin-bottom:24px}
+  .card{background:#1e293b;border:1px solid #334155;border-radius:12px;
+        padding:20px;margin-bottom:16px}
+  .card h2{font-size:.95rem;font-weight:600;color:#94a3b8;
+            text-transform:uppercase;letter-spacing:.05em;margin-bottom:14px}
+  .row{display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+  label{font-size:.88rem;color:#cbd5e1}
+  /* toggle switch */
+  .toggle{position:relative;display:inline-block;width:44px;height:24px}
+  .toggle input{opacity:0;width:0;height:0}
+  .slider{position:absolute;inset:0;background:#334155;border-radius:24px;
+          cursor:pointer;transition:.3s}
+  .slider:before{content:'';position:absolute;width:18px;height:18px;
+                 left:3px;bottom:3px;background:#94a3b8;border-radius:50%;transition:.3s}
+  input:checked+.slider{background:#0ea5e9}
+  input:checked+.slider:before{transform:translateX(20px);background:#fff}
+  /* mode pills */
+  .pills{display:flex;gap:6px}
+  .pill{padding:5px 14px;border-radius:20px;border:1px solid #334155;
+        background:transparent;color:#94a3b8;cursor:pointer;font-size:.83rem;transition:.2s}
+  .pill.active{background:#0ea5e9;border-color:#0ea5e9;color:#fff;font-weight:600}
+  /* domain lists */
+  .list-wrap{max-height:220px;overflow-y:auto;margin-bottom:10px}
+  .domain-item{display:flex;align-items:center;justify-content:space-between;
+               padding:7px 10px;border-radius:8px;margin-bottom:4px;
+               font-size:.83rem;font-family:monospace}
+  .domain-item.bl{background:#450a0a33;border:1px solid #7f1d1d55;color:#fca5a5}
+  .domain-item.wl{background:#052e1633;border:1px solid #14532d55;color:#86efac}
+  .del-btn{background:none;border:none;cursor:pointer;color:#64748b;
+           font-size:1rem;line-height:1;padding:2px 6px;border-radius:4px;transition:.2s}
+  .del-btn:hover{background:#334155;color:#f87171}
+  .add-row{display:flex;gap:8px;margin-top:6px}
+  input[type=text]{flex:1;padding:8px 12px;border-radius:8px;border:1px solid #334155;
+                   background:#0f172a;color:#e2e8f0;font-size:.88rem;outline:none}
+  input[type=text]:focus{border-color:#0ea5e9}
+  .btn{padding:8px 16px;border-radius:8px;border:none;cursor:pointer;
+       font-size:.88rem;font-weight:600;transition:.2s}
+  .btn-primary{background:#0ea5e9;color:#fff}
+  .btn-primary:hover{background:#38bdf8}
+  .btn-sm{padding:5px 12px;font-size:.8rem}
+  .status{display:inline-block;padding:3px 10px;border-radius:20px;
+          font-size:.78rem;font-weight:600;margin-left:8px}
+  .status.on{background:#052e16;color:#4ade80;border:1px solid #15803d}
+  .status.off{background:#1c1917;color:#78716c;border:1px solid #44403c}
+  .toast{position:fixed;bottom:20px;right:20px;padding:10px 18px;
+         border-radius:10px;font-size:.85rem;font-weight:600;opacity:0;
+         transition:opacity .3s;pointer-events:none;z-index:999}
+  .toast.show{opacity:1}
+  .toast.ok{background:#052e16;color:#4ade80;border:1px solid #15803d}
+  .toast.err{background:#450a0a;color:#fca5a5;border:1px solid #7f1d1d}
+  .empty{color:#475569;font-size:.82rem;text-align:center;padding:16px 0}
+  @media(max-width:480px){.add-row{flex-direction:column}}
+</style>
+</head>
+<body>
+
+<h1>🛡 DNS 过滤管理</h1>
+<p class="sub">ESP32-S3 NAT Router · 域名过滤</p>
+
+<!-- 总开关 -->
+<div class="card">
+  <h2>过滤状态</h2>
+  <div class="row">
+    <label class="toggle">
+      <input type="checkbox" id="chkEnabled">
+      <span class="slider"></span>
+    </label>
+    <label>启用 DNS 过滤</label>
+    <span class="status off" id="statusBadge">已关闭</span>
+  </div>
+  <div class="row">
+    <label>过滤模式：</label>
+    <div class="pills">
+      <button class="pill active" id="pillBL" onclick="setMode('blacklist')">🚫 黑名单</button>
+      <button class="pill"        id="pillWL" onclick="setMode('whitelist')">✅ 白名单</button>
+    </div>
+  </div>
+  <div style="margin-top:4px;font-size:.8rem;color:#64748b" id="modeDesc">
+    黑名单模式：列表中的域名将被拦截，其余放行。
+  </div>
+</div>
+
+<!-- 黑名单 -->
+<div class="card">
+  <h2>🚫 黑名单 <span id="blCount" style="color:#64748b;font-size:.8rem">(0)</span></h2>
+  <div class="list-wrap" id="blList"><p class="empty">黑名单为空</p></div>
+  <div class="add-row">
+    <input type="text" id="blInput" placeholder="例：ads.example.com 或 example.com（含子域名）">
+    <button class="btn btn-primary btn-sm" onclick="addDomain('blacklist')">添加</button>
+  </div>
+</div>
+
+<!-- 白名单 -->
+<div class="card">
+  <h2>✅ 白名单 <span id="wlCount" style="color:#64748b;font-size:.8rem">(0)</span></h2>
+  <div class="list-wrap" id="wlList"><p class="empty">白名单为空</p></div>
+  <div class="add-row">
+    <input type="text" id="wlInput" placeholder="例：google.com 或 github.com">
+    <button class="btn btn-primary btn-sm" onclick="addDomain('whitelist')">添加</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '/api/dns_filter';
+let state = { enabled: false, mode: 'blacklist', blacklist: [], whitelist: [] };
+
+async function load() {
+  try {
+    const r = await fetch(API);
+    state = await r.json();
+    render();
+  } catch(e) {
+    showToast('无法连接设备', 'err');
+  }
+}
+
+function render() {
+  // enabled toggle
+  document.getElementById('chkEnabled').checked = state.enabled;
+  const badge = document.getElementById('statusBadge');
+  badge.textContent = state.enabled ? '运行中' : '已关闭';
+  badge.className = 'status ' + (state.enabled ? 'on' : 'off');
+
+  // mode pills
+  document.getElementById('pillBL').className = 'pill' + (state.mode==='blacklist'?' active':'');
+  document.getElementById('pillWL').className = 'pill' + (state.mode==='whitelist'?' active':'');
+  document.getElementById('modeDesc').textContent = state.mode === 'blacklist'
+    ? '黑名单模式：列表中的域名将被拦截，其余全部放行。'
+    : '白名单模式：仅允许列表中的域名通过，其余全部拦截。';
+
+  renderList('bl', state.blacklist, 'blacklist');
+  renderList('wl', state.whitelist, 'whitelist');
+}
+
+function renderList(prefix, arr, listType) {
+  const el = document.getElementById(prefix + 'List');
+  document.getElementById(prefix + 'Count').textContent = `(${arr.length})`;
+  if (!arr.length) { el.innerHTML = '<p class="empty">列表为空</p>'; return; }
+  el.innerHTML = arr.map(d =>
+    `<div class="domain-item ${prefix}">
+       <span>${d}</span>
+       <button class="del-btn" title="删除" onclick="delDomain('${listType}','${d}')">✕</button>
+     </div>`
+  ).join('');
+}
+
+document.getElementById('chkEnabled').addEventListener('change', async e => {
+  state.enabled = e.target.checked;
+  await saveSettings();
+});
+
+async function setMode(mode) {
+  state.mode = mode;
+  render();
+  await saveSettings();
+}
+
+async function saveSettings() {
+  try {
+    await fetch(API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: state.enabled, mode: state.mode })
+    });
+    showToast('设置已保存', 'ok');
+  } catch { showToast('保存失败', 'err'); }
+}
+
+async function addDomain(listType) {
+  const inputId = listType === 'blacklist' ? 'blInput' : 'wlInput';
+  const domain = document.getElementById(inputId).value.trim().toLowerCase();
+  if (!domain) return;
+  if (!/^[a-z0-9]([a-z0-9\-\.]*[a-z0-9])?$/.test(domain)) {
+    showToast('域名格式不正确', 'err'); return;
+  }
+  try {
+    const r = await fetch(API + '/list', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ list: listType, domain })
+    });
+    if (!r.ok) throw new Error();
+    document.getElementById(inputId).value = '';
+    showToast('已添加：' + domain, 'ok');
+    await load();
+  } catch { showToast('添加失败', 'err'); }
+}
+
+async function delDomain(listType, domain) {
+  try {
+    const r = await fetch(API + '/list', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ list: listType, domain })
+    });
+    if (!r.ok) throw new Error();
+    showToast('已删除：' + domain, 'ok');
+    await load();
+  } catch { showToast('删除失败', 'err'); }
+}
+
+// Enter key support
+['blInput','wlInput'].forEach(id => {
+  document.getElementById(id).addEventListener('keydown', e => {
+    if (e.key === 'Enter') addDomain(id === 'blInput' ? 'blacklist' : 'whitelist');
+  });
+});
+
+let toastTimer;
+function showToast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + type;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.className = 'toast', 2500);
+}
+
+load();
+</script>
+</body>
+</html>
