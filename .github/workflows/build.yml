@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main, master ]
   pull_request:
-  workflow_dispatch:   # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build:
@@ -18,49 +18,70 @@ jobs:
       - name: Clone upstream esp32_nat_router
         run: |
           git clone --depth=1 https://github.com/martin-ger/esp32_nat_router.git upstream
-          # 将我们的新文件覆盖/追加进去
           cp main/dns_filter.h    upstream/main/
           cp main/dns_filter.c    upstream/main/
           cp main/dns_server.c    upstream/main/dns_server.c
           cp main/http_server_dns_filter_handlers.c upstream/main/
 
-      # ── 3. 修改 CMakeLists.txt，把新文件加入编译 ──────────────
-      - name: Patch CMakeLists.txt
-        working-directory: upstream
-        run: |
-          # 在 idf_component_register 的 SRCS 列表里追加新源文件
-          sed -i 's/SRCS "/SRCS "main\/dns_filter.c" "main\/http_server_dns_filter_handlers.c" "/' main/CMakeLists.txt || true
-
-          # 如果上面的 sed 失败（格式不同），用 Python 做追加
-          python3 - <<'PYEOF'
-          import re, pathlib
-          p = pathlib.Path('main/CMakeLists.txt')
-          txt = p.read_text()
-          if 'dns_filter.c' not in txt:
-              txt = txt.replace(
-                  'idf_component_register(',
-                  'idf_component_register(\n    SRCS "main/dns_filter.c" "main/http_server_dns_filter_handlers.c"'
-              )
-              p.write_text(txt)
-              print("Patched CMakeLists.txt via Python")
-          else:
-              print("dns_filter.c already in CMakeLists")
-          PYEOF
-
-      # ── 4. 在 app_main.c / http_server.c 中插入调用 ──────────
-      - name: Patch app_main.c to call dns_filter_init()
+      # ── 3. 修复 idf_component.yml：加入 esp32s3 支持 ─────────
+      - name: Patch idf_component.yml for esp32s3
         working-directory: upstream
         run: |
           python3 - <<'PYEOF'
           import pathlib, re
 
-          # ---- app_main.c: 加 include + dns_filter_init() 调用 ----
+          for yml_path in pathlib.Path('.').rglob('idf_component.yml'):
+              txt = yml_path.read_text()
+              print(f"Found: {yml_path}\nBefore:\n{txt}\n")
+
+              if 'targets' in txt:
+                  txt = re.sub(
+                      r'(targets\s*:\s*\[)([^\]]+)(\])',
+                      lambda m: m.group(1) + m.group(2).rstrip() + ', esp32s3' + m.group(3)
+                          if 'esp32s3' not in m.group(2) else m.group(0),
+                      txt
+                  )
+                  if 'esp32s3' not in txt:
+                      txt = re.sub(
+                          r'(targets:.*\n(?:\s+-\s+\S+\n)*)',
+                          r'\1  - esp32s3\n',
+                          txt
+                      )
+              yml_path.write_text(txt)
+              print(f"After:\n{txt}\n")
+          PYEOF
+
+      # ── 4. 修改 CMakeLists.txt ───────────────────────────────
+      - name: Patch CMakeLists.txt
+        working-directory: upstream
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, re
+          p = pathlib.Path('main/CMakeLists.txt')
+          txt = p.read_text()
+          print(f"CMakeLists before:\n{txt}")
+          if 'dns_filter.c' not in txt:
+              txt = re.sub(
+                  r'(idf_component_register\(SRCS\s+")',
+                  r'\1dns_filter.c"\n                             "http_server_dns_filter_handlers.c"\n                             "',
+                  txt, count=1
+              )
+              p.write_text(txt)
+          print(f"CMakeLists after:\n{p.read_text()}")
+          PYEOF
+
+      # ── 5. Patch app_main.c 和 http_server.c ─────────────────
+      - name: Patch source files
+        working-directory: upstream
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, re
+
           p = pathlib.Path('main/app_main.c')
           if p.exists():
               txt = p.read_text()
               if 'dns_filter_init' not in txt:
                   txt = '#include "dns_filter.h"\n' + txt
-                  # 在 app_main 函数体开始处（nvs_flash_init 之后）插入初始化
                   txt = re.sub(
                       r'(nvs_flash_init\s*\(\s*\)\s*;)',
                       r'\1\n    dns_filter_init();',
@@ -69,7 +90,6 @@ jobs:
                   p.write_text(txt)
                   print("Patched app_main.c")
 
-          # ---- http_server.c: 注册 handler ----
           for fname in ['main/http_server.c', 'main/esp32_nat_router.c']:
               p = pathlib.Path(fname)
               if not p.exists():
@@ -77,47 +97,48 @@ jobs:
               txt = p.read_text()
               if 'register_dns_filter_handlers' in txt:
                   break
-              # 在 httpd_start 调用后面追加 register_dns_filter_handlers
+              if 'httpd_start' not in txt:
+                  continue
+              txt = '#include "dns_filter.h"\n' + txt
               txt = re.sub(
                   r'(httpd_start\s*\([^)]+\)\s*;)',
                   r'\1\n    register_dns_filter_handlers(server);',
                   txt, count=1
               )
-              if '#include "http_server_dns_filter_handlers.c"' not in txt \
-                 and 'register_dns_filter_handlers' in txt:
-                  txt = '#include "dns_filter.h"\n' + txt
               p.write_text(txt)
               print(f"Patched {fname}")
               break
           PYEOF
 
-      # ── 5. 配置 sdkconfig 支持 ESP32-S3 ──────────────────────
-      - name: Patch sdkconfig for ESP32-S3
+      # ── 6. 配置 sdkconfig for ESP32-S3 ──────────────────────
+      - name: Patch sdkconfig.defaults
         working-directory: upstream
         run: |
+          grep -v 'CONFIG_IDF_TARGET\|CONFIG_ESPTOOLPY_FLASH' sdkconfig.defaults > tmp.defaults || true
+          mv tmp.defaults sdkconfig.defaults
           cat >> sdkconfig.defaults << 'EOF'
           CONFIG_IDF_TARGET="esp32s3"
           CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-          CONFIG_PARTITION_TABLE_TWO_OTA=n
-          CONFIG_PARTITION_TABLE_SINGLE_APP=y
           EOF
 
-      # ── 6. 设置 ESP-IDF 环境 ─────────────────────────────────
-      - name: Setup ESP-IDF v5.2
+      # ── 7. 编译 ──────────────────────────────────────────────
+      - name: Setup ESP-IDF v5.2 and build
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.2.2
           target: esp32s3
           path: upstream
-          command: idf.py build
+          command: >
+            pip install --upgrade idf-component-manager &&
+            idf.py build
 
-      # ── 7. 收集 .bin 文件 ────────────────────────────────────
+      # ── 8. 收集 bin 文件 ─────────────────────────────────────
       - name: Collect firmware binaries
         run: |
           mkdir -p firmware
-          find upstream/build -name "*.bin" -exec cp {} firmware/ \;
-          find upstream/build -name "flasher_args.json" -exec cp {} firmware/ \;
-          # 生成一键烧录脚本
+          find upstream/build -name "*.bin" -exec cp {} firmware/ \; 2>/dev/null || true
+          find upstream/build -name "flasher_args.json" -exec cp {} firmware/ \; 2>/dev/null || true
+
           cat > firmware/flash.sh << 'FLASH'
           #!/bin/bash
           PORT=${1:-/dev/ttyUSB0}
@@ -143,8 +164,9 @@ jobs:
             0x8000  partition-table.bin ^
             0x10000 esp32_nat_router.bin
           FLASHBAT
+          ls -lh firmware/
 
-      # ── 8. 上传 Artifact ─────────────────────────────────────
+      # ── 9. 上传 Artifact ─────────────────────────────────────
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
