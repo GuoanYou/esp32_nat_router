@@ -21,33 +21,41 @@ jobs:
           cp main/dns_server.c                      upstream/main/dns_server.c
           cp main/http_server_dns_filter_handlers.c upstream/main/
 
-      # 直接删掉所有 idf_component.yml，彻底消除目标芯片限制
-      - name: Remove idf_component.yml target restrictions
-        working-directory: upstream
-        run: |
-          find . -name "idf_component.yml" | while read f; do
-            echo "Removing target restriction from: $f"
-            python3 - "$f" <<'PYEOF'
-          import sys, re, pathlib
-          p = pathlib.Path(sys.argv[1])
-          txt = p.read_text()
-          # 删掉整个 targets 行（单行格式）
-          txt = re.sub(r'^\s*targets\s*:.*$', '', txt, flags=re.MULTILINE)
-          # 删掉 YAML 列表格式的 targets 块
-          txt = re.sub(r'targets:\s*\n(\s+-\s+\S+\s*\n)+', '', txt)
-          p.write_text(txt)
-          print(p.read_text())
-          PYEOF
-          done
-
-      - name: Patch CMakeLists.txt
+      - name: Patch all compatibility issues
         working-directory: upstream
         run: |
           python3 - <<'PYEOF'
           import pathlib, re
+
+          # ── 1. 删掉 idf_component.yml 里的 targets 限制 ──────────
+          for yml in pathlib.Path('.').rglob('idf_component.yml'):
+              txt = yml.read_text()
+              txt = re.sub(r'^\s*targets\s*:.*$', '', txt, flags=re.MULTILINE)
+              txt = re.sub(r'targets:\s*\n(\s+-\s+\S+\s*\n)+', '', txt)
+              yml.write_text(txt)
+              print(f"Patched {yml}")
+
+          # ── 2. 修复 cmd_system.c 里不存在的 CHIP_ESP32C5 ─────────
+          for f in pathlib.Path('.').rglob('cmd_system.c'):
+              txt = f.read_text()
+              if 'CHIP_ESP32C5' in txt:
+                  # 用 #ifdef 包裹，避免编译报错
+                  txt = txt.replace(
+                      'case CHIP_ESP32C5:',
+                      '#ifdef CHIP_ESP32C5\n        case CHIP_ESP32C5:'
+                  )
+                  # 找到这一行的 return，在其后加上 #endif
+                  txt = re.sub(
+                      r'(#ifdef CHIP_ESP32C5\n\s*case CHIP_ESP32C5:[^\n]*\n\s*return[^\n]*\n)',
+                      r'\1#endif\n',
+                      txt
+                  )
+                  f.write_text(txt)
+                  print(f"Patched CHIP_ESP32C5 in {f}")
+
+          # ── 3. CMakeLists.txt 加入新文件 ──────────────────────────
           p = pathlib.Path('main/CMakeLists.txt')
           txt = p.read_text()
-          print("Before:", txt)
           if 'dns_filter.c' not in txt:
               txt = re.sub(
                   r'(idf_component_register\(SRCS\s+")',
@@ -55,15 +63,9 @@ jobs:
                   txt, count=1
               )
               p.write_text(txt)
-          print("After:", p.read_text())
-          PYEOF
+              print("Patched CMakeLists.txt")
 
-      - name: Patch app_main.c and http_server.c
-        working-directory: upstream
-        run: |
-          python3 - <<'PYEOF'
-          import pathlib, re
-
+          # ── 4. app_main.c ─────────────────────────────────────────
           p = pathlib.Path('main/app_main.c')
           if p.exists():
               txt = p.read_text()
@@ -77,14 +79,13 @@ jobs:
                   p.write_text(txt)
                   print("Patched app_main.c")
 
+          # ── 5. http_server.c ──────────────────────────────────────
           for fname in ['main/http_server.c', 'main/esp32_nat_router.c']:
               p = pathlib.Path(fname)
               if not p.exists():
                   continue
               txt = p.read_text()
-              if 'register_dns_filter_handlers' in txt:
-                  break
-              if 'httpd_start' not in txt:
+              if 'register_dns_filter_handlers' in txt or 'httpd_start' not in txt:
                   continue
               txt = '#include "dns_filter.h"\n' + txt
               txt = re.sub(
@@ -95,6 +96,7 @@ jobs:
               p.write_text(txt)
               print(f"Patched {fname}")
               break
+
           PYEOF
 
       - name: Patch sdkconfig.defaults
@@ -103,9 +105,7 @@ jobs:
           grep -v 'CONFIG_IDF_TARGET\|CONFIG_ESPTOOLPY_FLASH' sdkconfig.defaults > tmp || true
           mv tmp sdkconfig.defaults
           printf '\nCONFIG_IDF_TARGET="esp32s3"\nCONFIG_ESPTOOLPY_FLASHSIZE_4MB=y\n' >> sdkconfig.defaults
-          cat sdkconfig.defaults
 
-      # 换用 ESP-IDF v5.3，原生支持 esp32s3，且组件管理器版本匹配
       - name: Build with ESP-IDF v5.3
         uses: espressif/esp-idf-ci-action@v1
         with:
@@ -117,7 +117,7 @@ jobs:
       - name: Collect firmware binaries
         run: |
           mkdir -p firmware
-          find upstream/build -name "*.bin"          -exec cp {} firmware/ \; 2>/dev/null || true
+          find upstream/build -name "*.bin"             -exec cp {} firmware/ \; 2>/dev/null || true
           find upstream/build -name "flasher_args.json" -exec cp {} firmware/ \; 2>/dev/null || true
 
           cat > firmware/flash.sh << 'FLASH'
