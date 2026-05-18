@@ -33,25 +33,73 @@ jobs:
               txt = re.sub(r'^\s*targets\s*:.*$', '', txt, flags=re.MULTILINE)
               txt = re.sub(r'targets:\s*\n(\s+-\s+\S+\s*\n)+', '', txt)
               yml.write_text(txt)
-              print(f"Patched {yml}")
+              print(f"Patched targets in {yml}")
 
-          # ── 2. 修复 cmd_system.c 里不存在的 CHIP_ESP32C5 ─────────
+          # ── 2. 替换整个 get_chip_model_name 函数 ─────────────────
+          # 用一个兼容所有 ESP-IDF 版本的实现替换掉
+          SAFE_FUNC = r"""static const char* get_chip_model_name(esp_chip_model_t model)
+          {
+              switch (model) {
+          #ifdef CHIP_ESP32
+                  case CHIP_ESP32:    return "ESP32";
+          #endif
+          #ifdef CHIP_ESP32S2
+                  case CHIP_ESP32S2:  return "ESP32-S2";
+          #endif
+          #ifdef CHIP_ESP32S3
+                  case CHIP_ESP32S3:  return "ESP32-S3";
+          #endif
+          #ifdef CHIP_ESP32C3
+                  case CHIP_ESP32C3:  return "ESP32-C3";
+          #endif
+          #ifdef CHIP_ESP32C2
+                  case CHIP_ESP32C2:  return "ESP32-C2";
+          #endif
+          #ifdef CHIP_ESP32C5
+                  case CHIP_ESP32C5:  return "ESP32-C5";
+          #endif
+          #ifdef CHIP_ESP32C6
+                  case CHIP_ESP32C6:  return "ESP32-C6";
+          #endif
+          #ifdef CHIP_ESP32H2
+                  case CHIP_ESP32H2:  return "ESP32-H2";
+          #endif
+          #ifdef CHIP_ESP32P4
+                  case CHIP_ESP32P4:  return "ESP32-P4";
+          #endif
+          #ifdef CHIP_ESP32C61
+                  case CHIP_ESP32C61: return "ESP32-C61";
+          #endif
+          #ifdef CHIP_POSIX_LINUX
+                  case CHIP_POSIX_LINUX: return "Linux";
+          #endif
+                  default:            return "Unknown";
+              }
+          }
+          """
+
           for f in pathlib.Path('.').rglob('cmd_system.c'):
               txt = f.read_text()
-              if 'CHIP_ESP32C5' in txt:
-                  # 用 #ifdef 包裹，避免编译报错
-                  txt = txt.replace(
-                      'case CHIP_ESP32C5:',
-                      '#ifdef CHIP_ESP32C5\n        case CHIP_ESP32C5:'
+              # 用正则匹配整个函数并替换
+              new_txt = re.sub(
+                  r'static const char\*\s+get_chip_model_name\s*\([^)]*\)\s*\{[^}]*(?:\{[^}]*\}[^}]*)?\}',
+                  SAFE_FUNC,
+                  txt,
+                  flags=re.DOTALL
+              )
+              if new_txt != txt:
+                  f.write_text(new_txt)
+                  print(f"Replaced get_chip_model_name in {f}")
+              else:
+                  # 备用方案：直接在函数里加 default case
+                  new_txt = re.sub(
+                      r'(switch\s*\(\s*model\s*\)\s*\{)(.*?)(^\s*\})',
+                      lambda m: m.group(1) + m.group(2) + '        default: return "Unknown";\n    }',
+                      txt,
+                      flags=re.DOTALL | re.MULTILINE
                   )
-                  # 找到这一行的 return，在其后加上 #endif
-                  txt = re.sub(
-                      r'(#ifdef CHIP_ESP32C5\n\s*case CHIP_ESP32C5:[^\n]*\n\s*return[^\n]*\n)',
-                      r'\1#endif\n',
-                      txt
-                  )
-                  f.write_text(txt)
-                  print(f"Patched CHIP_ESP32C5 in {f}")
+                  f.write_text(new_txt)
+                  print(f"Added default case in {f}")
 
           # ── 3. CMakeLists.txt 加入新文件 ──────────────────────────
           p = pathlib.Path('main/CMakeLists.txt')
